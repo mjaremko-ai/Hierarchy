@@ -132,14 +132,38 @@ def lookup_parent(name: str, domain: str) -> dict:
 
 
 def detect_columns(fieldnames: list[str]) -> tuple[str, str]:
-    """Detect which CSV columns hold the account name and domain."""
+    """Detect which CSV columns hold the account name and domain.
+
+    Priority order for name: exact 'name', then 'account name', then any col
+    containing 'name', then 'company'/'org'/'account' (excluding ID cols).
+    """
     name_col = domain_col = None
+
+    def score_name(f: str) -> int:
+        fl = f.lower().strip()
+        if fl in ("name", "account name", "company name"):
+            return 4
+        if "name" in fl and "id" not in fl:
+            return 3
+        if any(kw in fl for kw in ("company", "org")) and "id" not in fl:
+            return 2
+        if "account" in fl and "id" not in fl:
+            return 1
+        return 0
+
+    best = 0
+    for f in fieldnames:
+        s = score_name(f)
+        if s > best:
+            best = s
+            name_col = f
+
     for f in fieldnames:
         fl = f.lower().strip()
-        if name_col is None and any(kw in fl for kw in ("name", "account", "company", "org")):
-            name_col = f
-        if domain_col is None and any(kw in fl for kw in ("domain", "website", "url", "site")):
+        if any(kw in fl for kw in ("domain", "website", "url", "site")):
             domain_col = f
+            break
+
     return name_col, domain_col
 
 
