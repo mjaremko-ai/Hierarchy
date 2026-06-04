@@ -1,20 +1,53 @@
 import csv
 import io
 import json
+import queue
 import re
+import threading
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from flask import Flask, render_template, request, Response
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024  # 5 MB upload limit
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10 MB upload limit
 
 WIKIDATA_ENDPOINT = "https://query.wikidata.org/sparql"
 WIKIDATA_SEARCH = "https://www.wikidata.org/w/api.php"
 HEADERS = {"User-Agent": "HierarchyLookup/1.0 (hierarchy-lookup-tool)"}
 
+# --- Rate limiter (token bucket) -------------------------------------------
+# Wikidata asks for ≤ 5 req/s total; DDG is best-effort.
+# We use 4 req/s for Wikidata and a separate 2 req/s bucket for DDG.
+
+class TokenBucket:
+    def __init__(self, rate: float, capacity: float):
+        self._rate = rate
+        self._capacity = capacity
+        self._tokens = capacity
+        self._lock = threading.Lock()
+        self._last = time.monotonic()
+
+    def acquire(self):
+        with self._lock:
+            now = time.monotonic()
+            self._tokens = min(self._capacity, self._tokens + (now - self._last) * self._rate)
+            self._last = now
+            if self._tokens >= 1:
+                self._tokens -= 1
+                return
+        # Wait for a token
+        time.sleep(1.0 / self._rate)
+        self.acquire()
+
+
+_wikidata_bucket = TokenBucket(rate=4.0, capacity=4.0)
+_ddg_bucket = TokenBucket(rate=2.0, capacity=2.0)
+
+
+# ---------------------------------------------------------------------------
 
 def search_wikidata_entity(name: str) -> str | None:
     """Return the Wikidata QID for a company name, or None."""
@@ -26,6 +59,7 @@ def search_wikidata_entity(name: str) -> str | None:
         "limit": 5,
         "format": "json",
     }
+    _wikidata_bucket.acquire()
     try:
         r = requests.get(WIKIDATA_SEARCH, params=params, headers=HEADERS, timeout=10)
         r.raise_for_status()
@@ -51,6 +85,7 @@ SELECT ?parent ?parentLabel ?website WHERE {{
 }}
 LIMIT 1
 """
+    _wikidata_bucket.acquire()
     try:
         r = requests.get(
             WIKIDATA_ENDPOINT,
@@ -73,8 +108,9 @@ LIMIT 1
 
 def search_parent_via_ddg(name: str, domain: str) -> dict | None:
     """Fall back to DuckDuckGo search to find parent company info."""
+    _ddg_bucket.acquire()
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
 
         query = f'"{name}" parent company'
         with DDGS() as ddgs:
@@ -82,7 +118,6 @@ def search_parent_via_ddg(name: str, domain: str) -> dict | None:
 
         for result in results:
             body = (result.get("body") or "") + " " + (result.get("title") or "")
-            # Look for patterns like "is a subsidiary of X" or "owned by X"
             patterns = [
                 r"subsidiary of ([A-Z][A-Za-z0-9\s,\.&]+?)[\.,\(\)]",
                 r"owned by ([A-Z][A-Za-z0-9\s,\.&]+?)[\.,\(\)]",
@@ -100,7 +135,6 @@ def search_parent_via_ddg(name: str, domain: str) -> dict | None:
 
 
 def extract_domain(url: str) -> str:
-    """Extract the bare domain from a URL."""
     try:
         parsed = urllib.parse.urlparse(url)
         host = parsed.netloc or parsed.path
@@ -111,7 +145,7 @@ def extract_domain(url: str) -> str:
 
 
 def lookup_parent(name: str, domain: str) -> dict:
-    """Main lookup: try Wikidata first, fall back to DDG search."""
+    """Try Wikidata first, fall back to DDG search."""
     result = {"parent_name": "", "parent_domain": "", "source": ""}
 
     qid = search_wikidata_entity(name)
@@ -122,7 +156,6 @@ def lookup_parent(name: str, domain: str) -> dict:
             result["source"] = "Wikidata"
             return result
 
-    # Wikidata had no parent — try DDG
     parent = search_parent_via_ddg(name, domain)
     if parent and parent["parent_name"]:
         result.update(parent)
@@ -132,11 +165,7 @@ def lookup_parent(name: str, domain: str) -> dict:
 
 
 def detect_columns(fieldnames: list[str]) -> tuple[str, str]:
-    """Detect which CSV columns hold the account name and domain.
-
-    Priority order for name: exact 'name', then 'account name', then any col
-    containing 'name', then 'company'/'org'/'account' (excluding ID cols).
-    """
+    """Detect name and domain columns with priority scoring."""
     name_col = domain_col = None
 
     def score_name(f: str) -> int:
@@ -166,6 +195,10 @@ def detect_columns(fieldnames: list[str]) -> tuple[str, str]:
 
     return name_col, domain_col
 
+
+# ---------------------------------------------------------------------------
+# Flask routes
+# ---------------------------------------------------------------------------
 
 @app.route("/", methods=["GET"])
 def index():
@@ -205,30 +238,38 @@ def stream():
     rows = data.get("rows", [])
     name_col = data.get("name_col", "name")
     domain_col = data.get("domain_col", "")
+    workers = min(int(data.get("workers", 8)), 20)
+
+    result_queue: queue.Queue = queue.Queue()
+
+    def process(i: int, row: dict):
+        name = row.get(name_col, "").strip()
+        domain = row.get(domain_col, "").strip() if domain_col else ""
+        parent = lookup_parent(name, domain) if name else {"parent_name": "", "parent_domain": "", "source": ""}
+        result_queue.put({
+            "index": i,
+            "name": name,
+            "domain": domain,
+            "parent_name": parent["parent_name"],
+            "parent_domain": parent["parent_domain"],
+            "source": parent["source"],
+        })
 
     def generate():
-        results = []
-        for i, row in enumerate(rows):
-            name = row.get(name_col, "").strip()
-            domain = row.get(domain_col, "").strip() if domain_col else ""
-            if not name:
-                parent = {"parent_name": "", "parent_domain": "", "source": ""}
-            else:
-                parent = lookup_parent(name, domain)
-                time.sleep(0.3)  # be polite to external APIs
+        completed = 0
+        total = len(rows)
 
-            result = {
-                "index": i,
-                "name": name,
-                "domain": domain,
-                "parent_name": parent["parent_name"],
-                "parent_domain": parent["parent_domain"],
-                "source": parent["source"],
-            }
-            results.append(result)
-            yield f"data: {json.dumps(result)}\n\n"
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(process, i, row): i for i, row in enumerate(rows)}
+            while completed < total:
+                try:
+                    result = result_queue.get(timeout=30)
+                    completed += 1
+                    yield f"data: {json.dumps(result)}\n\n"
+                except queue.Empty:
+                    continue
 
-        yield f"data: {json.dumps({'done': True, 'total': len(results)})}\n\n"
+        yield f"data: {json.dumps({'done': True, 'total': total})}\n\n"
 
     return Response(generate(), mimetype="text/event-stream")
 
@@ -258,4 +299,4 @@ def download():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=5000, threaded=True)
