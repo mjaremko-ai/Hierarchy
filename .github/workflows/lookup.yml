@@ -1,0 +1,53 @@
+name: Account Hierarchy Lookup
+
+on:
+  push:
+    paths:
+      - 'input/*.csv'
+  workflow_dispatch:
+    inputs:
+      workers:
+        description: 'Parallel workers (2–20)'
+        required: false
+        default: '8'
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Find input CSV
+        id: find_csv
+        run: |
+          CSV=$(ls input/*.csv 2>/dev/null | head -1)
+          if [ -z "$CSV" ]; then
+            echo "No CSV found in input/. Please add one and push."
+            exit 1
+          fi
+          echo "path=$CSV" >> $GITHUB_OUTPUT
+          echo "Found: $CSV"
+
+      - name: Run hierarchy lookup
+        run: |
+          python run_lookup.py \
+            "${{ steps.find_csv.outputs.path }}" \
+            hierarchy_results.csv \
+            --workers ${{ github.event.inputs.workers || '8' }}
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: hierarchy-results
+          path: hierarchy_results.csv
+          retention-days: 30
