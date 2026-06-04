@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Processing — Account Hierarchy Lookup</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f0f4f8; min-height: 100vh; padding: 32px 16px; }
+    .container { max-width: 960px; margin: 0 auto; }
+    h1 { font-size: 1.5rem; color: #1a202c; margin-bottom: 6px; }
+    .back { color: #4299e1; text-decoration: none; font-size: .9rem; }
+    .back:hover { text-decoration: underline; }
+    .progress-wrap { background: #e2e8f0; border-radius: 99px; height: 8px; margin: 20px 0 8px; overflow: hidden; }
+    .progress-bar { height: 100%; background: #4299e1; border-radius: 99px; transition: width .3s; width: 0%; }
+    .status { font-size: .9rem; color: #718096; margin-bottom: 24px; }
+    .card { background: #fff; border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,.08); overflow: hidden; }
+    table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+    thead th { background: #f7fafc; color: #4a5568; font-weight: 600; text-align: left; padding: 12px 16px; border-bottom: 1px solid #e2e8f0; white-space: nowrap; }
+    tbody tr:nth-child(even) { background: #f7fafc; }
+    tbody td { padding: 10px 16px; border-bottom: 1px solid #e2e8f0; color: #2d3748; vertical-align: middle; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 99px; font-size: .75rem; font-weight: 600; }
+    .badge-wikidata { background: #ebf8ff; color: #2b6cb0; }
+    .badge-web { background: #f0fff4; color: #276749; }
+    .badge-none { background: #f7fafc; color: #a0aec0; }
+    .badge-pending { background: #fffaf0; color: #c05621; }
+    .actions { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; }
+    .btn { padding: 10px 20px; border: none; border-radius: 8px; font-size: .9rem; font-weight: 600; cursor: pointer; transition: background .2s; }
+    .btn-primary { background: #4299e1; color: #fff; }
+    .btn-primary:hover { background: #3182ce; }
+    .btn-primary:disabled { background: #a0aec0; cursor: not-allowed; }
+    .btn-secondary { background: #edf2f7; color: #4a5568; }
+    .btn-secondary:hover { background: #e2e8f0; }
+    .domain-link { color: #4299e1; text-decoration: none; }
+    .domain-link:hover { text-decoration: underline; }
+    .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #e2e8f0; border-top-color: #4299e1; border-radius: 50%; animation: spin .6s linear infinite; vertical-align: middle; margin-right: 6px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px;">
+      <h1>Account Hierarchy Lookup</h1>
+      <a href="/" class="back">&#8592; Upload another file</a>
+    </div>
+
+    <div class="progress-wrap"><div class="progress-bar" id="progressBar"></div></div>
+    <div class="status" id="statusText"><span class="spinner"></span> Starting lookup…</div>
+
+    <div class="actions">
+      <button class="btn btn-primary" id="downloadBtn" disabled>Download CSV</button>
+    </div>
+
+    <div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Account Name</th>
+            <th>Domain</th>
+            <th>Parent Name</th>
+            <th>Parent Domain</th>
+            <th>Source</th>
+          </tr>
+        </thead>
+        <tbody id="resultsBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    const rows     = {{ rows | safe }};
+    const nameCol  = {{ name_col | tojson }};
+    const domainCol = {{ domain_col | tojson }};
+    const total    = {{ total }};
+    const allResults = [];
+
+    const progressBar = document.getElementById('progressBar');
+    const statusText  = document.getElementById('statusText');
+    const tbody       = document.getElementById('resultsBody');
+    const downloadBtn = document.getElementById('downloadBtn');
+
+    // Pre-fill rows with pending state
+    rows.forEach((row, i) => {
+      const tr = document.createElement('tr');
+      tr.id = `row-${i}`;
+      tr.innerHTML = `
+        <td>${i + 1}</td>
+        <td>${esc(row[nameCol] || '')}</td>
+        <td>${domainLink(row[domainCol] || '')}</td>
+        <td colspan="3" style="color:#a0aec0"><span class="spinner"></span> Looking up…</td>
+      `;
+      tbody.appendChild(tr);
+    });
+
+    fetch('/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rows, name_col: nameCol, domain_col: domainCol }),
+    }).then(res => {
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      function read() {
+        reader.read().then(({ done, value }) => {
+          if (done) return;
+          buffer += decoder.decode(value, { stream: true });
+          const parts = buffer.split('\n\n');
+          buffer = parts.pop();
+          parts.forEach(part => {
+            if (!part.startsWith('data: ')) return;
+            const data = JSON.parse(part.slice(6));
+            if (data.done) {
+              statusText.innerHTML = `Done — ${data.total} accounts processed.`;
+              progressBar.style.width = '100%';
+              downloadBtn.disabled = false;
+              return;
+            }
+            allResults.push(data);
+            updateRow(data);
+            const pct = Math.round(((data.index + 1) / total) * 100);
+            progressBar.style.width = pct + '%';
+            statusText.innerHTML = `<span class="spinner"></span> Processing ${data.index + 1} of ${total}…`;
+          });
+          read();
+        });
+      }
+      read();
+    });
+
+    function updateRow(data) {
+      const tr = document.getElementById(`row-${data.index}`);
+      if (!tr) return;
+      const sourceBadge = data.source === 'Wikidata'
+        ? `<span class="badge badge-wikidata">Wikidata</span>`
+        : data.source === 'Web search'
+        ? `<span class="badge badge-web">Web</span>`
+        : `<span class="badge badge-none">Not found</span>`;
+      tr.innerHTML = `
+        <td>${data.index + 1}</td>
+        <td>${esc(data.name)}</td>
+        <td>${domainLink(data.domain)}</td>
+        <td>${esc(data.parent_name) || '<span style="color:#a0aec0">—</span>'}</td>
+        <td>${domainLink(data.parent_domain)}</td>
+        <td>${sourceBadge}</td>
+      `;
+    }
+
+    downloadBtn.addEventListener('click', () => {
+      fetch('/download', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(allResults),
+      }).then(res => res.blob()).then(blob => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = 'hierarchy_results.csv'; a.click();
+        URL.revokeObjectURL(url);
+      });
+    });
+
+    function esc(s) {
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+    function domainLink(d) {
+      if (!d) return '<span style="color:#a0aec0">—</span>';
+      const href = d.startsWith('http') ? d : 'https://' + d;
+      return `<a class="domain-link" href="${esc(href)}" target="_blank" rel="noopener">${esc(d)}</a>`;
+    }
+  </script>
+</body>
+</html>
